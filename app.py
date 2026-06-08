@@ -22,6 +22,11 @@ try:
 except ImportError:
     fdr = None
 
+try:
+    from pykrx import stock as pykrx_stock
+except ImportError:
+    pykrx_stock = None
+
 
 DEFAULT_TICKERS = {
     "005930": "삼성전자",
@@ -387,22 +392,46 @@ def market_name_from_suffix(suffix: str) -> str:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_krx_listing() -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+
     if fdr is None:
+        pass
+    else:
+        try:
+            listing = fdr.StockListing("KRX")
+            expected_columns = {"Code", "Name", "Market"}
+            if expected_columns.issubset(set(listing.columns)):
+                listing = listing[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
+                frames.append(listing)
+        except Exception:
+            pass
+
+    if pykrx_stock is not None:
+        today = date.today().strftime("%Y%m%d")
+        for market_name in ["KOSPI", "KOSDAQ", "KONEX"]:
+            try:
+                tickers = pykrx_stock.get_market_ticker_list(today, market=market_name)
+                rows = [
+                    {
+                        "Code": ticker,
+                        "Name": pykrx_stock.get_market_ticker_name(ticker),
+                        "Market": market_name,
+                    }
+                    for ticker in tickers
+                ]
+                frames.append(pd.DataFrame(rows))
+            except Exception:
+                continue
+
+    if not frames:
         return pd.DataFrame(columns=["Code", "Name", "Market"])
 
-    try:
-        listing = fdr.StockListing("KRX")
-    except Exception:
-        return pd.DataFrame(columns=["Code", "Name", "Market"])
-
-    expected_columns = {"Code", "Name", "Market"}
-    if not expected_columns.issubset(set(listing.columns)):
-        return pd.DataFrame(columns=["Code", "Name", "Market"])
-
-    listing = listing[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
-    listing["Code"] = listing["Code"].astype(str).str.zfill(6)
-    listing["Name"] = listing["Name"].astype(str)
-    return listing.drop_duplicates(subset=["Code"])
+    frame = pd.concat(frames, ignore_index=True)
+    frame = frame[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
+    frame["Code"] = frame["Code"].astype(str).str.zfill(6)
+    frame["Name"] = frame["Name"].astype(str)
+    frame["Market"] = frame["Market"].astype(str)
+    return frame.drop_duplicates(subset=["Code"])
 
 
 def extract_stock_items_from_json(value: object) -> list[dict[str, str]]:
@@ -496,8 +525,15 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
     alias_text = STOCK_ALIASES.get(text, text)
     normalized_query = normalize_search_text(alias_text)
     digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) == 6:
+        direct = pd.DataFrame(
+            [{"Code": digits, "Name": f"종목코드 {digits}", "Market": "KOSPI"}]
+        )
+    else:
+        direct = pd.DataFrame(columns=["Code", "Name", "Market"])
+
     online_matches = fetch_naver_stock_search(alias_text)
-    candidates = pd.concat([listing, online_matches], ignore_index=True).drop_duplicates(subset=["Code"])
+    candidates = pd.concat([listing, online_matches, direct], ignore_index=True).drop_duplicates(subset=["Code"])
     if candidates.empty:
         return pd.DataFrame(columns=["Code", "Name", "Market", "Label"])
     candidates["NormalizedName"] = candidates["Name"].map(normalize_search_text)
@@ -539,6 +575,16 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
 
     matched["Label"] = matched["Name"] + " (" + matched["Code"] + ", " + matched["Market"].astype(str) + ")"
     return matched[["Code", "Name", "Market", "Label"]]
+
+
+def stock_search_status(listing: pd.DataFrame) -> str:
+    sources = []
+    if fdr is not None:
+        sources.append("FinanceDataReader")
+    if pykrx_stock is not None:
+        sources.append("pykrx")
+    source_text = ", ".join(sources) if sources else "설치된 온라인 종목 목록 패키지 없음"
+    return f"종목 목록 {len(listing):,}개 로드됨 · 소스: {source_text}"
 
 
 def online_stock_universe(query_text: str, limit: int) -> pd.DataFrame:
@@ -1344,6 +1390,7 @@ with st.sidebar:
 
     if asset_type == "주식":
         listing = load_krx_listing()
+        st.caption(stock_search_status(listing))
         default_stock_query = (
             selected_history["code"]
             if selected_history and selected_history.get("asset_type") == "주식"
@@ -1352,7 +1399,9 @@ with st.sidebar:
         stock_query = st.text_input("종목 이름 또는 코드", value=default_stock_query, help=HELP_TEXT["stock_search"])
         matches = search_krx_listing(stock_query, listing)
         if matches.empty:
-            st.warning("온라인 검색 결과가 없습니다. 종목명을 조금 줄이거나 6자리 종목 코드를 직접 입력해 주세요.")
+            st.warning(
+                "온라인 검색 결과가 없습니다. 종목 목록 로드 수가 0개라면 requirements.txt를 최신으로 올린 뒤 앱을 재부팅해 주세요."
+            )
             raw_ticker = st.text_input("종목 코드 직접 입력", value="005930")
             market = st.radio("시장", options=[("KOSPI", ".KS"), ("KOSDAQ", ".KQ")], format_func=lambda item: item[0])
         else:

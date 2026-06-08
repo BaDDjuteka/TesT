@@ -6,3 +6,4 @@ plotly>=5.22.0
 requests>=2.32.0
 beautifulsoup4>=4.12.0
 finance-datareader>=0.9.96
+pykrx>=1.0.48
