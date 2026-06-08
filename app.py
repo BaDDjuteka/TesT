@@ -22,11 +22,6 @@ try:
 except ImportError:
     fdr = None
 
-try:
-    from pykrx import stock as pykrx_stock
-except ImportError:
-    pykrx_stock = None
-
 
 DEFAULT_TICKERS = {
     "005930": "삼성전자",
@@ -409,35 +404,6 @@ def load_krx_listing() -> pd.DataFrame:
         except Exception:
             errors.append("FinanceDataReader 조회 실패")
 
-    if pykrx_stock is not None:
-        pykrx_loaded = False
-        for day_offset in range(0, 14):
-            target_date = (date.today() - timedelta(days=day_offset)).strftime("%Y%m%d")
-            day_frames: list[pd.DataFrame] = []
-            for market_name in ["KOSPI", "KOSDAQ", "KONEX"]:
-                try:
-                    tickers = pykrx_stock.get_market_ticker_list(target_date, market=market_name)
-                    rows = [
-                        {
-                            "Code": ticker,
-                            "Name": pykrx_stock.get_market_ticker_name(ticker),
-                            "Market": market_name,
-                        }
-                        for ticker in tickers
-                    ]
-                    if rows:
-                        day_frames.append(pd.DataFrame(rows))
-                except Exception:
-                    continue
-            if day_frames:
-                frames.extend(day_frames)
-                pykrx_loaded = True
-                break
-        if not pykrx_loaded:
-            errors.append("pykrx 조회 실패")
-    else:
-        errors.append("pykrx 미설치")
-
     if not frames:
         empty = pd.DataFrame(columns=["Code", "Name", "Market"])
         empty.attrs["errors"] = errors
@@ -451,6 +417,58 @@ def load_krx_listing() -> pd.DataFrame:
     result = frame.drop_duplicates(subset=["Code"])
     result.attrs["errors"] = errors
     return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yahoo_stock_search(query: str) -> pd.DataFrame:
+    text = query.strip()
+    if not text:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+        )
+    }
+    try:
+        response = requests.get(
+            "https://query1.finance.yahoo.com/v1/finance/search",
+            params={
+                "q": text,
+                "quotesCount": 50,
+                "newsCount": 0,
+                "lang": "ko-KR",
+                "region": "KR",
+            },
+            headers=headers,
+            timeout=8,
+        )
+        response.raise_for_status()
+        quotes = response.json().get("quotes", [])
+    except (requests.RequestException, ValueError):
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+    rows: list[dict[str, str]] = []
+    for quote in quotes:
+        symbol = str(quote.get("symbol", ""))
+        if not symbol.endswith((".KS", ".KQ")):
+            continue
+        code = symbol.split(".")[0]
+        if not re.fullmatch(r"\d{6}", code):
+            continue
+        rows.append(
+            {
+                "Code": code,
+                "Name": str(quote.get("shortname") or quote.get("longname") or symbol),
+                "Market": "KOSDAQ" if symbol.endswith(".KQ") else "KOSPI",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+    return pd.DataFrame(rows).drop_duplicates(subset=["Code"])[["Code", "Name", "Market"]]
 
 
 def extract_stock_items_from_json(value: object) -> list[dict[str, str]]:
@@ -551,8 +569,9 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
     else:
         direct = pd.DataFrame(columns=["Code", "Name", "Market"])
 
-    online_matches = fetch_naver_stock_search(alias_text)
-    candidates = pd.concat([listing, online_matches, direct], ignore_index=True).drop_duplicates(subset=["Code"])
+    naver_matches = fetch_naver_stock_search(alias_text)
+    yahoo_matches = fetch_yahoo_stock_search(alias_text)
+    candidates = pd.concat([listing, naver_matches, yahoo_matches, direct], ignore_index=True).drop_duplicates(subset=["Code"])
     if candidates.empty:
         return pd.DataFrame(columns=["Code", "Name", "Market", "Label"])
     candidates["NormalizedName"] = candidates["Name"].map(normalize_search_text)
@@ -600,9 +619,8 @@ def stock_search_status(listing: pd.DataFrame) -> str:
     sources = []
     if fdr is not None:
         sources.append("FinanceDataReader")
-    if pykrx_stock is not None:
-        sources.append("pykrx")
-    source_text = ", ".join(sources) if sources else "설치된 온라인 종목 목록 패키지 없음"
+    sources.extend(["네이버 금융 실시간 검색", "Yahoo Finance 실시간 검색"])
+    source_text = ", ".join(sources)
     errors = listing.attrs.get("errors", [])
     error_text = f" · 상태: {', '.join(errors)}" if errors else ""
     return f"종목 목록 {len(listing):,}개 로드됨 · 소스: {source_text}{error_text}"
@@ -1421,7 +1439,7 @@ with st.sidebar:
         matches = search_krx_listing(stock_query, listing)
         if matches.empty:
             st.warning(
-                "온라인 검색 결과가 없습니다. 종목 목록 로드 수가 0개라면 requirements.txt를 최신으로 올린 뒤 앱을 재부팅해 주세요."
+                "실시간 검색 결과가 없습니다. 종목명을 더 짧게 입력하거나 6자리 종목 코드를 직접 입력해 주세요."
             )
             raw_ticker = st.text_input("종목 코드 직접 입력", value="005930")
             market = st.radio("시장", options=[("KOSPI", ".KS"), ("KOSDAQ", ".KQ")], format_func=lambda item: item[0])
