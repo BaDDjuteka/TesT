@@ -39,6 +39,19 @@ DEFAULT_TICKERS = {
     "373220": "LG에너지솔루션",
     "247540": "에코프로비엠",
     "086520": "에코프로",
+    "016880": "웅진",
+    "095720": "웅진씽크빅",
+    "103130": "웅진에너지",
+    "000150": "두산",
+    "241560": "두산밥캣",
+    "034020": "두산에너빌리티",
+    "336260": "두산퓨얼셀",
+    "042670": "HD현대인프라코어",
+    "034950": "한국기업평가",
+    "214680": "디알텍",
+    "060570": "드림어스컴퍼니",
+    "192650": "드림텍",
+    "348950": "제이알글로벌리츠",
     "028260": "삼성물산",
     "006400": "삼성SDI",
     "018260": "삼성에스디에스",
@@ -92,6 +105,8 @@ DEFAULT_STOCK_MARKETS = {
     "293490": ".KQ",
     "041510": ".KQ",
     "035900": ".KQ",
+    "060570": ".KQ",
+    "192650": ".KS",
 }
 
 STOCK_ALIASES = {
@@ -121,6 +136,11 @@ DEFAULT_COINS = {
     "KRW-DOT": "폴카닷",
     "KRW-AVAX": "아발란체",
     "KRW-SUI": "수이",
+}
+
+DEFAULT_SCAN_KEYWORDS = {
+    "주식": "삼성 두산 웅진 드림 카카오 네이버 현대 LG SK 셀트리온 한화 에코 포스코",
+    "코인": "BTC ETH XRP SOL DOGE ADA LINK DOT AVAX SUI",
 }
 
 COIN_KEYWORDS = {
@@ -334,8 +354,7 @@ def coin_query(market: str) -> str:
 def asset_display_name(asset_type: str, raw_ticker: str) -> str:
     if asset_type == "주식":
         code = krx_code(raw_ticker)
-        name = DEFAULT_TICKERS.get(code, "직접 입력 종목")
-        return f"{name} ({code})" if code else raw_ticker.strip().upper()
+        return f"종목 ({code})" if code else raw_ticker.strip().upper()
 
     market = raw_ticker.strip().upper()
     name = DEFAULT_COINS.get(market, "직접 입력 코인")
@@ -344,6 +363,13 @@ def asset_display_name(asset_type: str, raw_ticker: str) -> str:
 
 def app_title(asset_type: str, raw_ticker: str) -> str:
     return f"{asset_display_name(asset_type, raw_ticker)} 분석 및 자동 매매 신호"
+
+
+def app_title_from_name(asset_type: str, raw_ticker: str, display_name: str = "") -> str:
+    if display_name:
+        code = krx_code(raw_ticker) if asset_type == "주식" else raw_ticker.strip().upper()
+        return f"{display_name} ({code}) 분석 및 자동 매매 신호"
+    return app_title(asset_type, raw_ticker)
 
 
 def normalize_search_text(value: str) -> str:
@@ -355,35 +381,111 @@ def normalize_search_text(value: str) -> str:
     return text
 
 
+def market_name_from_suffix(suffix: str) -> str:
+    return "KOSDAQ" if suffix == ".KQ" else "KOSPI"
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_krx_listing() -> pd.DataFrame:
-    fallback = pd.DataFrame(
-        [
-            {
-                "Code": code,
-                "Name": name,
-                "Market": "KOSDAQ" if DEFAULT_STOCK_MARKETS.get(code) == ".KQ" else "KOSPI",
-            }
-            for code, name in DEFAULT_TICKERS.items()
-        ]
-    )
-
     if fdr is None:
-        return fallback
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
 
     try:
         listing = fdr.StockListing("KRX")
     except Exception:
-        return fallback
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
 
     expected_columns = {"Code", "Name", "Market"}
     if not expected_columns.issubset(set(listing.columns)):
-        return fallback
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
 
     listing = listing[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
     listing["Code"] = listing["Code"].astype(str).str.zfill(6)
     listing["Name"] = listing["Name"].astype(str)
     return listing.drop_duplicates(subset=["Code"])
+
+
+def extract_stock_items_from_json(value: object) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+    if isinstance(value, dict):
+        code = str(value.get("code") or value.get("cd") or value.get("symbol") or "")
+        name = str(value.get("name") or value.get("nm") or value.get("title") or "")
+        market = str(value.get("market") or value.get("marketName") or value.get("type") or "KOSPI")
+        if re.fullmatch(r"\d{6}", code) and name:
+            found.append({"Code": code, "Name": name, "Market": market})
+        for child in value.values():
+            found.extend(extract_stock_items_from_json(child))
+    elif isinstance(value, list):
+        text_values = [str(item) for item in value]
+        code = next((item for item in text_values if re.fullmatch(r"\d{6}", item)), "")
+        market = next((item for item in text_values if "KOSDAQ" in item.upper() or "KOSPI" in item.upper()), "KOSPI")
+        name = ""
+        for item in text_values:
+            if item != code and not item.startswith("http") and not re.fullmatch(r"\d+", item):
+                if normalize_search_text(item):
+                    name = BeautifulSoup(item, "html.parser").get_text(" ", strip=True)
+                    break
+        if code and name:
+            found.append({"Code": code, "Name": name, "Market": market})
+        for child in value:
+            found.extend(extract_stock_items_from_json(child))
+    return found
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_naver_stock_search(query: str) -> pd.DataFrame:
+    text = query.strip()
+    if not text:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+        )
+    }
+    rows: list[dict[str, str]] = []
+
+    try:
+        response = requests.get(
+            "https://ac.finance.naver.com/ac",
+            params={"q": text, "q_enc": "UTF-8", "st": "111", "r_lt": "111"},
+            headers=headers,
+            timeout=6,
+        )
+        response.raise_for_status()
+        rows.extend(extract_stock_items_from_json(response.json()))
+    except (requests.RequestException, ValueError):
+        pass
+
+    try:
+        response = requests.get(
+            "https://finance.naver.com/search/searchList.naver",
+            params={"query": text},
+            headers=headers,
+            timeout=6,
+        )
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "euc-kr"
+        soup = BeautifulSoup(response.text, "html.parser")
+        for link in soup.select("a[href*='code=']"):
+            href = link.get("href", "")
+            match = re.search(r"code=(\d{6})", href)
+            name = link.get_text(" ", strip=True)
+            if match and name:
+                surrounding = link.find_parent().get_text(" ", strip=True) if link.find_parent() else ""
+                market = "KOSDAQ" if "코스닥" in surrounding or "KOSDAQ" in surrounding.upper() else "KOSPI"
+                rows.append({"Code": match.group(1), "Name": name, "Market": market})
+    except requests.RequestException:
+        pass
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+    frame["Code"] = frame["Code"].astype(str).str.zfill(6)
+    frame["Name"] = frame["Name"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    frame["Market"] = frame["Market"].astype(str).fillna("KOSPI")
+    return frame.drop_duplicates(subset=["Code"])[["Code", "Name", "Market"]]
 
 
 def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd.DataFrame:
@@ -394,7 +496,10 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
     alias_text = STOCK_ALIASES.get(text, text)
     normalized_query = normalize_search_text(alias_text)
     digits = "".join(ch for ch in text if ch.isdigit())
-    candidates = listing.copy()
+    online_matches = fetch_naver_stock_search(alias_text)
+    candidates = pd.concat([listing, online_matches], ignore_index=True).drop_duplicates(subset=["Code"])
+    if candidates.empty:
+        return pd.DataFrame(columns=["Code", "Name", "Market", "Label"])
     candidates["NormalizedName"] = candidates["Name"].map(normalize_search_text)
     candidates["Score"] = 0.0
 
@@ -434,6 +539,52 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
 
     matched["Label"] = matched["Name"] + " (" + matched["Code"] + ", " + matched["Market"].astype(str) + ")"
     return matched[["Code", "Name", "Market", "Label"]]
+
+
+def online_stock_universe(query_text: str, limit: int) -> pd.DataFrame:
+    listing = load_krx_listing()
+    frames: list[pd.DataFrame] = []
+    for keyword in query_text.split():
+        matches = search_krx_listing(keyword, listing, limit=limit)
+        if not matches.empty:
+            frames.append(matches[["Code", "Name", "Market"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["Code", "Name", "Market"])
+
+    frame = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Code"])
+    return frame.head(limit)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_upbit_markets() -> pd.DataFrame:
+    response = requests.get("https://api.upbit.com/v1/market/all", params={"isDetails": "false"}, timeout=8)
+    response.raise_for_status()
+    frame = pd.DataFrame(response.json())
+    if frame.empty:
+        return pd.DataFrame(columns=["Code", "Name"])
+    frame = frame[frame["market"].astype(str).str.startswith("KRW-")].copy()
+    frame = frame.rename(columns={"market": "Code", "korean_name": "Name"})
+    return frame[["Code", "Name"]].drop_duplicates(subset=["Code"])
+
+
+def online_coin_universe(query_text: str, limit: int) -> pd.DataFrame:
+    try:
+        markets = fetch_upbit_markets()
+    except requests.RequestException:
+        markets = pd.DataFrame([{"Code": code, "Name": name} for code, name in DEFAULT_COINS.items()])
+
+    if markets.empty:
+        return pd.DataFrame(columns=["Code", "Name"])
+
+    keywords = [normalize_search_text(keyword) for keyword in query_text.split() if keyword.strip()]
+    if not keywords:
+        return markets.head(limit)
+
+    frame = markets.copy()
+    frame["SearchText"] = (frame["Code"].astype(str) + " " + frame["Name"].astype(str)).map(normalize_search_text)
+    mask = frame["SearchText"].apply(lambda value: any(keyword in value for keyword in keywords))
+    return frame[mask][["Code", "Name"]].head(limit)
 
 
 def market_suffix_from_name(market_name: str) -> str:
@@ -1061,13 +1212,24 @@ def make_profit_plan(data: pd.DataFrame, signal_score: int, community_score: int
     )
 
 
-def scan_candidates(asset_type: str, period: str, stock_suffix: str = ".KS") -> pd.DataFrame:
+def scan_candidates(
+    asset_type: str,
+    period: str,
+    stock_suffix: str = ".KS",
+    universe_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    universe = DEFAULT_TICKERS if asset_type == "주식" else DEFAULT_COINS
+    if universe_frame is None or universe_frame.empty:
+        universe = pd.DataFrame(columns=["Code", "Name", "Market"])
+    else:
+        universe = universe_frame.copy()
 
-    for code, name in universe.items():
+    for _, item in universe.iterrows():
+        code = str(item["Code"])
+        name = str(item["Name"])
+        market_name = str(item.get("Market", "KOSPI"))
         try:
-            ticker = normalize_krx_ticker(code, DEFAULT_STOCK_MARKETS.get(code, stock_suffix)) if asset_type == "주식" else code
+            ticker = normalize_krx_ticker(code, market_suffix_from_name(market_name) if asset_type == "주식" else stock_suffix) if asset_type == "주식" else code
             raw_data = load_price_data(ticker, period) if asset_type == "주식" else load_upbit_daily_data(ticker, period)
             if raw_data.empty or len(raw_data) < 70:
                 continue
@@ -1190,10 +1352,7 @@ with st.sidebar:
         stock_query = st.text_input("종목 이름 또는 코드", value=default_stock_query, help=HELP_TEXT["stock_search"])
         matches = search_krx_listing(stock_query, listing)
         if matches.empty:
-            if fdr is None:
-                st.warning("검색 결과가 없습니다. 전체 KRX 검색을 쓰려면 finance-datareader 설치가 필요합니다.")
-            else:
-                st.warning("검색 결과가 없습니다. 종목명을 조금 줄이거나 6자리 종목 코드를 직접 입력해 주세요.")
+            st.warning("온라인 검색 결과가 없습니다. 종목명을 조금 줄이거나 6자리 종목 코드를 직접 입력해 주세요.")
             raw_ticker = st.text_input("종목 코드 직접 입력", value="005930")
             market = st.radio("시장", options=[("KOSPI", ".KS"), ("KOSDAQ", ".KQ")], format_func=lambda item: item[0])
         else:
@@ -1241,28 +1400,45 @@ with st.sidebar:
     max_allocation_pct = st.slider("종목당 최대 투입", min_value=1, max_value=50, value=10, step=1, help=HELP_TEXT["max_allocation"])
     atr_multiplier = st.slider("ATR 손절 배수", min_value=1.0, max_value=4.0, value=2.0, step=0.25, help=HELP_TEXT["atr_multiplier"])
 
+    st.header("단기 후보 스캔")
+    stock_scan_keywords = st.text_area(
+        "주식 후보 검색어",
+        value=DEFAULT_SCAN_KEYWORDS["주식"],
+        help="공백으로 여러 검색어를 입력하면 온라인 종목 검색 결과를 합쳐서 후보군을 만듭니다.",
+        height=80,
+    )
+    coin_scan_keywords = st.text_area(
+        "코인 후보 검색어",
+        value=DEFAULT_SCAN_KEYWORDS["코인"],
+        help="업비트 KRW 마켓에서 심볼이나 코인명을 검색해 후보군을 만듭니다.",
+        height=80,
+    )
+    scan_limit = st.slider("스캔 후보 수", min_value=5, max_value=50, value=20, step=5)
+
     run = st.button("분석 실행", type="primary", use_container_width=True)
     scan_short_term = st.button("단기 후보 스캔", use_container_width=True)
 
 ticker = normalize_krx_ticker(raw_ticker, market[1]) if asset_type == "주식" else raw_ticker.strip().upper()
 code = krx_code(raw_ticker) if asset_type == "주식" else ""
 unit = "원" if asset_type in {"주식", "코인"} else ""
-title_area.title(app_title(asset_type, raw_ticker))
+title_area.title(app_title_from_name(asset_type, raw_ticker, selected_asset_name))
 
 if scan_short_term:
     st.subheader("단기 매매 후보")
-    st.caption("대표 목록을 기술적 신호로 빠르게 걸러낸 후보입니다. 추천/투자 조언이 아니라 추가 확인용 관심 목록입니다.")
+    st.caption("온라인 검색으로 후보군을 만든 뒤 기술적 신호로 걸러낸 결과입니다. 추천/투자 조언이 아니라 추가 확인용 관심 목록입니다.")
     show_candidate_help()
 
     with st.spinner("주식과 코인 후보를 스캔하는 중입니다..."):
-        stock_candidates = scan_candidates("주식", "6mo", ".KS")
-        coin_candidates = scan_candidates("코인", "6mo")
+        stock_universe = online_stock_universe(stock_scan_keywords, scan_limit)
+        coin_universe = online_coin_universe(coin_scan_keywords, scan_limit)
+        stock_candidates = scan_candidates("주식", "6mo", ".KS", stock_universe)
+        coin_candidates = scan_candidates("코인", "6mo", universe_frame=coin_universe)
 
     left, right = st.columns(2)
     with left:
-        st.write("주식 후보")
+        st.write(f"주식 후보 분석 결과 ({len(stock_universe)}개 검색)")
         if stock_candidates.empty:
-            st.info("표시할 주식 후보가 없습니다.")
+            st.info("표시할 주식 후보가 없습니다. 검색어를 바꾸거나 후보 수를 늘려보세요.")
         else:
             st.dataframe(
                 stock_candidates.style.format(
@@ -1283,9 +1459,9 @@ if scan_short_term:
             )
 
     with right:
-        st.write("코인 후보")
+        st.write(f"코인 후보 분석 결과 ({len(coin_universe)}개 검색)")
         if coin_candidates.empty:
-            st.info("표시할 코인 후보가 없습니다.")
+            st.info("표시할 코인 후보가 없습니다. 검색어를 바꾸거나 후보 수를 늘려보세요.")
         else:
             st.dataframe(
                 coin_candidates.style.format(
@@ -1326,7 +1502,7 @@ if run or raw_ticker:
     community_results: list[CommunityResult] = []
     if asset_type == "주식":
         history_code = krx_code(raw_ticker)
-        history_name = selected_asset_name or DEFAULT_TICKERS.get(history_code, asset_display_name(asset_type, raw_ticker).split(" (")[0])
+        history_name = selected_asset_name or asset_display_name(asset_type, raw_ticker).split(" (")[0]
         add_view_history(asset_type, history_code, history_name, market[0])
     else:
         history_code = ticker
