@@ -184,6 +184,9 @@ HELP_TEXT = {
     "reward_risk": "목표 수익폭을 손절폭으로 나눈 값입니다. 2.0이면 손실 1 대비 기대 수익 2라는 뜻입니다.",
     "upside": "최근 20일 또는 60일 고점까지 남은 상승 여지입니다.",
     "momentum_5d": "최근 5거래일 수익률입니다. 단기 힘이 있는지 확인합니다.",
+    "holding_avg": "현재 보유 중인 평균 매수가입니다. 보유 중이 아니면 0으로 두면 됩니다.",
+    "holding_qty": "현재 보유 수량입니다. 주식은 주 수, 코인은 보유 코인 수량을 입력합니다.",
+    "additional_cash": "물타기나 추가매수 가능성을 계산할 때 사용할 추가 투입 가능 금액입니다.",
 }
 
 
@@ -318,6 +321,18 @@ class ProfitPlan:
     upside_to_20d_high: float
     upside_to_60d_high: float
     momentum_5d: float
+    notes: list[str]
+
+
+@dataclass(frozen=True)
+class HoldingPlan:
+    opinion: str
+    pnl_pct: float
+    pnl_amount: float
+    cost_value: float
+    current_value: float
+    new_avg_price: float
+    additional_qty: float
     notes: list[str]
 
 
@@ -1081,6 +1096,17 @@ def show_candidate_help() -> None:
         st.dataframe(help_frame, use_container_width=True, hide_index=True)
 
 
+def show_link_table(frame: pd.DataFrame, limit: int) -> None:
+    st.dataframe(
+        frame[["출처", "날짜", "제목", "링크"]].head(limit),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "링크": st.column_config.LinkColumn("링크", display_text="열기"),
+        },
+    )
+
+
 def rsi(close: pd.Series, window: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0)
@@ -1367,6 +1393,80 @@ def make_profit_plan(data: pd.DataFrame, signal_score: int, community_score: int
     )
 
 
+def make_holding_plan(
+    asset_type: str,
+    current_price: float,
+    avg_price: float,
+    quantity: float,
+    additional_cash: float,
+    signal_score: int,
+    risk_plan: RiskPlan,
+    profit_plan: ProfitPlan,
+) -> HoldingPlan | None:
+    if avg_price <= 0 or quantity <= 0 or current_price <= 0:
+        return None
+
+    cost_value = avg_price * quantity
+    current_value = current_price * quantity
+    pnl_amount = current_value - cost_value
+    pnl_pct = ((current_price / avg_price) - 1) * 100
+
+    additional_qty = 0.0
+    new_avg_price = avg_price
+    if additional_cash > 0:
+        raw_additional_qty = additional_cash / current_price
+        additional_qty = np.floor(raw_additional_qty) if asset_type == "주식" else round(raw_additional_qty, 8)
+        if additional_qty > 0:
+            new_avg_price = ((avg_price * quantity) + (current_price * additional_qty)) / (quantity + additional_qty)
+
+    notes: list[str] = []
+
+    if current_price <= risk_plan.stop_price:
+        opinion = "손절/비중축소 우선"
+        notes.append("현재가가 기준 손절가 이하입니다. 물타기보다 손실 제한을 먼저 검토하는 구간입니다.")
+    elif pnl_pct >= profit_plan.target_return_1 and profit_plan.reward_risk_1 < 1.2:
+        opinion = "일부 익절 검토"
+        notes.append("수익 구간이지만 추가 손익비가 낮아 일부 이익 실현을 검토할 수 있습니다.")
+    elif pnl_pct >= 8 and signal_score < 2:
+        opinion = "이익 보호/분할 매도"
+        notes.append("수익 중이나 기술적 신호가 약해지고 있어 이익 보호가 중요합니다.")
+    elif pnl_pct < -10 and signal_score < 2:
+        opinion = "물타기 금지/손실 관리"
+        notes.append("손실 폭이 크고 신호가 약합니다. 추가매수보다 손절선과 비중 축소 기준을 우선하세요.")
+    elif pnl_pct < 0 and signal_score >= 2 and risk_plan.risk_score <= 3 and additional_qty > 0:
+        opinion = "소액 물타기 가능"
+        notes.append("손실 중이지만 추세 신호와 위험 등급이 나쁘지 않아 소액 분할 물타기만 검토할 수 있습니다.")
+    elif signal_score >= 2 and risk_plan.risk_score <= 3:
+        opinion = "버티기/분할 추가매수"
+        notes.append("기술적 신호와 위험 등급이 비교적 양호해 보유 유지가 가능한 구간입니다.")
+    elif risk_plan.risk_score >= 6:
+        opinion = "비중축소/대기"
+        notes.append("위험 등급이 높습니다. 반등 기대보다 포지션 축소와 현금 확보를 우선하는 편이 좋습니다.")
+    else:
+        opinion = "버티기/관망"
+        notes.append("뚜렷한 추가매수 근거가 부족합니다. 손절가와 목표가 사이에서 관망 성격이 강합니다.")
+
+    if additional_cash > 0:
+        if additional_qty > 0:
+            notes.append(f"추가 투입 시 예상 평단은 {new_avg_price:,.0f}원입니다.")
+        else:
+            notes.append("추가 투입 가능 금액으로는 계산 가능한 추가 수량이 거의 없습니다.")
+
+    if pnl_pct < 0 and current_price < avg_price and current_price > risk_plan.stop_price:
+        notes.append("물타기는 한 번에 크게 넣기보다 2~3회 분할하고, 손절 기준을 유지하는 편이 안전합니다.")
+
+    return HoldingPlan(
+        opinion=opinion,
+        pnl_pct=pnl_pct,
+        pnl_amount=pnl_amount,
+        cost_value=cost_value,
+        current_value=current_value,
+        new_avg_price=new_avg_price,
+        additional_qty=additional_qty,
+        notes=notes,
+    )
+
+
 def scan_candidates(
     asset_type: str,
     period: str,
@@ -1570,6 +1670,13 @@ with st.sidebar:
     max_allocation_pct = st.slider("종목당 최대 투입", min_value=1, max_value=50, value=10, step=1, help=HELP_TEXT["max_allocation"])
     atr_multiplier = st.slider("ATR 손절 배수", min_value=1.0, max_value=4.0, value=2.0, step=0.25, help=HELP_TEXT["atr_multiplier"])
 
+    st.header("내 보유 상태")
+    avg_step = 100.0 if asset_type == "주식" else 1.0
+    qty_step = 1.0 if asset_type == "주식" else 0.0001
+    holding_avg_price = st.number_input("평균 매수가", min_value=0.0, value=0.0, step=avg_step, help=HELP_TEXT["holding_avg"])
+    holding_quantity = st.number_input("보유 수량", min_value=0.0, value=0.0, step=qty_step, format="%.8f", help=HELP_TEXT["holding_qty"])
+    additional_cash = st.number_input("추가 투입 가능금액", min_value=0.0, value=0.0, step=10000.0, help=HELP_TEXT["additional_cash"])
+
     st.header("단기 후보 스캔")
     scan_limit = st.slider("스캔 후보 수", min_value=5, max_value=50, value=20, step=5)
 
@@ -1728,7 +1835,7 @@ if run or raw_ticker:
                 combined_posts = pd.concat([result.posts for result in results if not result.posts.empty], ignore_index=True)
                 if not combined_posts.empty:
                     st.write("최근 수집 글")
-                    st.dataframe(combined_posts[["출처", "날짜", "제목", "링크"]].head(30), use_container_width=True)
+                    show_link_table(combined_posts, 30)
             else:
                 st.info("선택된 비교 소스가 없습니다.")
 
@@ -1757,7 +1864,7 @@ if run or raw_ticker:
             combined_posts = pd.concat([result.posts for result in results if not result.posts.empty], ignore_index=True)
             if not combined_posts.empty:
                 st.write("최근 수집 글")
-                st.dataframe(combined_posts[["출처", "날짜", "제목", "링크"]].head(30), use_container_width=True)
+                show_link_table(combined_posts, 30)
         else:
             st.info("선택된 비교 소스가 없습니다.")
 
@@ -1774,7 +1881,7 @@ if run or raw_ticker:
             news_posts = pd.concat([result.posts for result in news_results if not result.posts.empty], ignore_index=True)
             if not news_posts.empty:
                 st.write("최근 뉴스")
-                st.dataframe(news_posts[["출처", "날짜", "제목", "링크"]].head(40), use_container_width=True)
+                show_link_table(news_posts, 40)
         else:
             st.info("선택된 뉴스 소스가 없습니다.")
 
@@ -1794,6 +1901,16 @@ if run or raw_ticker:
         signal_score=signal.score,
         community_score=community_score,
         stop_price=risk_plan.stop_price,
+    )
+    holding_plan = make_holding_plan(
+        asset_type=asset_type,
+        current_price=float(latest["Close"]),
+        avg_price=float(holding_avg_price),
+        quantity=float(holding_quantity),
+        additional_cash=float(additional_cash),
+        signal_score=signal.score,
+        risk_plan=risk_plan,
+        profit_plan=profit_plan,
     )
 
     st.subheader("손실 최소화 계획")
@@ -1823,6 +1940,16 @@ if run or raw_ticker:
     pp3.metric("5일 모멘텀", f"{profit_plan.momentum_5d:.2f}%", help=HELP_TEXT["momentum_5d"])
     for note in profit_plan.notes:
         st.write(f"- {note}")
+
+    if holding_plan:
+        st.subheader("내 보유 기준 의견")
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("보유 의견", holding_plan.opinion)
+        h2.metric("평가손익률", f"{holding_plan.pnl_pct:.2f}%", f"{holding_plan.pnl_amount:,.0f}원")
+        h3.metric("평가금액", f"{holding_plan.current_value:,.0f}원", f"매입 {holding_plan.cost_value:,.0f}원")
+        h4.metric("물타기 후 평단", f"{holding_plan.new_avg_price:,.0f}원", f"추가수량 {holding_plan.additional_qty:,.6g}")
+        for note in holding_plan.notes:
+            st.write(f"- {note}")
 
     st.subheader("최근 지표")
     recent = data[["Close", "MA5", "MA20", "MA60", "ATR20", "RSI14", "RETURN_5D", "RETURN_20D", "MACD", "MACD_SIGNAL", "Volume"]].tail(10)
