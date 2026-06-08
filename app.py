@@ -393,9 +393,10 @@ def market_name_from_suffix(suffix: str) -> str:
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_krx_listing() -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
+    errors: list[str] = []
 
     if fdr is None:
-        pass
+        errors.append("FinanceDataReader 미설치")
     else:
         try:
             listing = fdr.StockListing("KRX")
@@ -403,35 +404,53 @@ def load_krx_listing() -> pd.DataFrame:
             if expected_columns.issubset(set(listing.columns)):
                 listing = listing[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
                 frames.append(listing)
+            else:
+                errors.append("FinanceDataReader 컬럼 형식 불일치")
         except Exception:
-            pass
+            errors.append("FinanceDataReader 조회 실패")
 
     if pykrx_stock is not None:
-        today = date.today().strftime("%Y%m%d")
-        for market_name in ["KOSPI", "KOSDAQ", "KONEX"]:
-            try:
-                tickers = pykrx_stock.get_market_ticker_list(today, market=market_name)
-                rows = [
-                    {
-                        "Code": ticker,
-                        "Name": pykrx_stock.get_market_ticker_name(ticker),
-                        "Market": market_name,
-                    }
-                    for ticker in tickers
-                ]
-                frames.append(pd.DataFrame(rows))
-            except Exception:
-                continue
+        pykrx_loaded = False
+        for day_offset in range(0, 14):
+            target_date = (date.today() - timedelta(days=day_offset)).strftime("%Y%m%d")
+            day_frames: list[pd.DataFrame] = []
+            for market_name in ["KOSPI", "KOSDAQ", "KONEX"]:
+                try:
+                    tickers = pykrx_stock.get_market_ticker_list(target_date, market=market_name)
+                    rows = [
+                        {
+                            "Code": ticker,
+                            "Name": pykrx_stock.get_market_ticker_name(ticker),
+                            "Market": market_name,
+                        }
+                        for ticker in tickers
+                    ]
+                    if rows:
+                        day_frames.append(pd.DataFrame(rows))
+                except Exception:
+                    continue
+            if day_frames:
+                frames.extend(day_frames)
+                pykrx_loaded = True
+                break
+        if not pykrx_loaded:
+            errors.append("pykrx 조회 실패")
+    else:
+        errors.append("pykrx 미설치")
 
     if not frames:
-        return pd.DataFrame(columns=["Code", "Name", "Market"])
+        empty = pd.DataFrame(columns=["Code", "Name", "Market"])
+        empty.attrs["errors"] = errors
+        return empty
 
     frame = pd.concat(frames, ignore_index=True)
     frame = frame[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
     frame["Code"] = frame["Code"].astype(str).str.zfill(6)
     frame["Name"] = frame["Name"].astype(str)
     frame["Market"] = frame["Market"].astype(str)
-    return frame.drop_duplicates(subset=["Code"])
+    result = frame.drop_duplicates(subset=["Code"])
+    result.attrs["errors"] = errors
+    return result
 
 
 def extract_stock_items_from_json(value: object) -> list[dict[str, str]]:
@@ -584,7 +603,9 @@ def stock_search_status(listing: pd.DataFrame) -> str:
     if pykrx_stock is not None:
         sources.append("pykrx")
     source_text = ", ".join(sources) if sources else "설치된 온라인 종목 목록 패키지 없음"
-    return f"종목 목록 {len(listing):,}개 로드됨 · 소스: {source_text}"
+    errors = listing.attrs.get("errors", [])
+    error_text = f" · 상태: {', '.join(errors)}" if errors else ""
+    return f"종목 목록 {len(listing):,}개 로드됨 · 소스: {source_text}{error_text}"
 
 
 def online_stock_universe(query_text: str, limit: int) -> pd.DataFrame:
