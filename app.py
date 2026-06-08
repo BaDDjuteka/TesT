@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -37,11 +39,75 @@ DEFAULT_TICKERS = {
     "373220": "LG에너지솔루션",
     "247540": "에코프로비엠",
     "086520": "에코프로",
+    "028260": "삼성물산",
+    "006400": "삼성SDI",
+    "018260": "삼성에스디에스",
+    "032830": "삼성생명",
+    "000810": "삼성화재",
+    "029780": "삼성카드",
+    "016360": "삼성증권",
+    "010140": "삼성중공업",
+    "028050": "삼성E&A",
+    "003550": "LG",
+    "066570": "LG전자",
+    "034220": "LG디스플레이",
+    "096770": "SK이노베이션",
+    "034730": "SK",
+    "017670": "SK텔레콤",
+    "033780": "KT&G",
+    "003670": "포스코퓨처엠",
+    "005490": "POSCO홀딩스",
+    "086790": "하나금융지주",
+    "316140": "우리금융지주",
+    "323410": "카카오뱅크",
+    "377300": "카카오페이",
+    "352820": "하이브",
+    "259960": "크래프톤",
+    "251270": "넷마블",
+    "036570": "엔씨소프트",
+    "009150": "삼성전기",
+    "000270": "기아",
+    "012330": "현대모비스",
+    "010130": "고려아연",
+    "011200": "HMM",
+    "010950": "S-Oil",
+    "090430": "아모레퍼시픽",
+    "128940": "한미약품",
+    "196170": "알테오젠",
+    "091990": "셀트리온헬스케어",
+    "293490": "카카오게임즈",
+    "041510": "에스엠",
+    "035900": "JYP Ent.",
 }
 
 DEFAULT_STOCK_MARKETS = {
     "247540": ".KQ",
     "086520": ".KQ",
+    "352820": ".KS",
+    "259960": ".KS",
+    "251270": ".KS",
+    "036570": ".KS",
+    "196170": ".KQ",
+    "091990": ".KQ",
+    "293490": ".KQ",
+    "041510": ".KQ",
+    "035900": ".KQ",
+}
+
+STOCK_ALIASES = {
+    "삼전": "삼성전자",
+    "하닉": "SK하이닉스",
+    "슼하이닉스": "SK하이닉스",
+    "네이버": "NAVER",
+    "카뱅": "카카오뱅크",
+    "카카오페이": "카카오페이",
+    "엘지화학": "LG화학",
+    "엘지전자": "LG전자",
+    "엘지엔솔": "LG에너지솔루션",
+    "포홀": "POSCO홀딩스",
+    "포스코홀딩스": "POSCO홀딩스",
+    "한에": "한화에어로스페이스",
+    "에코비": "에코프로비엠",
 }
 
 DEFAULT_COINS = {
@@ -280,6 +346,15 @@ def app_title(asset_type: str, raw_ticker: str) -> str:
     return f"{asset_display_name(asset_type, raw_ticker)} 분석 및 자동 매매 신호"
 
 
+def normalize_search_text(value: str) -> str:
+    text = str(value).lower()
+    text = text.replace("&", "앤")
+    text = re.sub(r"\(.*?\)", "", text)
+    text = re.sub(r"[\s\-_.,/·]", "", text)
+    text = text.replace("주식회사", "").replace("(주)", "").replace("㈜", "")
+    return text
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_krx_listing() -> pd.DataFrame:
     fallback = pd.DataFrame(
@@ -311,24 +386,54 @@ def load_krx_listing() -> pd.DataFrame:
     return listing.drop_duplicates(subset=["Code"])
 
 
-def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 20) -> pd.DataFrame:
+def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd.DataFrame:
     text = query.strip()
     if not text:
         return pd.DataFrame(columns=["Code", "Name", "Market", "Label"])
 
+    alias_text = STOCK_ALIASES.get(text, text)
+    normalized_query = normalize_search_text(alias_text)
     digits = "".join(ch for ch in text if ch.isdigit())
-    if len(digits) >= 2:
-        matched = listing[listing["Code"].str.contains(digits, na=False)]
-    else:
-        normalized = text.lower()
-        matched = listing[listing["Name"].str.lower().str.contains(normalized, na=False)]
+    candidates = listing.copy()
+    candidates["NormalizedName"] = candidates["Name"].map(normalize_search_text)
+    candidates["Score"] = 0.0
 
+    if len(digits) >= 2:
+        candidates.loc[candidates["Code"].str.startswith(digits, na=False), "Score"] += 120
+        candidates.loc[candidates["Code"].str.contains(digits, na=False), "Score"] += 80
+
+    exact_mask = candidates["NormalizedName"].eq(normalized_query)
+    starts_mask = candidates["NormalizedName"].str.startswith(normalized_query, na=False)
+    contains_mask = candidates["NormalizedName"].str.contains(normalized_query, na=False)
+    raw_contains_mask = candidates["Name"].astype(str).str.contains(alias_text, case=False, regex=False, na=False)
+
+    candidates.loc[exact_mask, "Score"] += 150
+    candidates.loc[starts_mask, "Score"] += 110
+    candidates.loc[contains_mask, "Score"] += 80
+    candidates.loc[raw_contains_mask, "Score"] += 80
+
+    if normalized_query:
+        candidates["Similarity"] = candidates["NormalizedName"].apply(
+            lambda name: SequenceMatcher(None, normalized_query, name).ratio()
+        )
+        candidates["Score"] += candidates["Similarity"] * 45
+    else:
+        candidates["Similarity"] = 0.0
+
+    market_bonus = candidates["Market"].astype(str).str.upper().map(
+        lambda market: 5 if "KOSPI" in market else (3 if "KOSDAQ" in market else 0)
+    )
+    candidates["Score"] += market_bonus
+
+    matched = candidates[candidates["Score"] >= 35].sort_values(
+        ["Score", "Market", "Name"], ascending=[False, True, True]
+    )
     matched = matched.head(limit).copy()
     if matched.empty:
         return pd.DataFrame(columns=["Code", "Name", "Market", "Label"])
 
     matched["Label"] = matched["Name"] + " (" + matched["Code"] + ", " + matched["Market"].astype(str) + ")"
-    return matched
+    return matched[["Code", "Name", "Market", "Label"]]
 
 
 def market_suffix_from_name(market_name: str) -> str:
@@ -1085,11 +1190,19 @@ with st.sidebar:
         stock_query = st.text_input("종목 이름 또는 코드", value=default_stock_query, help=HELP_TEXT["stock_search"])
         matches = search_krx_listing(stock_query, listing)
         if matches.empty:
-            st.warning("검색 결과가 없습니다. 6자리 종목 코드를 직접 입력해 주세요.")
+            if fdr is None:
+                st.warning("검색 결과가 없습니다. 전체 KRX 검색을 쓰려면 finance-datareader 설치가 필요합니다.")
+            else:
+                st.warning("검색 결과가 없습니다. 종목명을 조금 줄이거나 6자리 종목 코드를 직접 입력해 주세요.")
             raw_ticker = st.text_input("종목 코드 직접 입력", value="005930")
             market = st.radio("시장", options=[("KOSPI", ".KS"), ("KOSDAQ", ".KQ")], format_func=lambda item: item[0])
         else:
-            selected_label = st.selectbox("검색 결과", matches["Label"].tolist())
+            result_labels = matches["Label"].head(15).tolist()
+            selected_label = st.radio(
+                "검색 결과 선택",
+                result_labels,
+                label_visibility="visible",
+            )
             selected = matches[matches["Label"] == selected_label].iloc[0]
             raw_ticker = str(selected["Code"])
             selected_asset_name = str(selected["Name"])
