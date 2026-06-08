@@ -6,8 +6,11 @@ import re
 from dataclasses import dataclass
 from datetime import date, timedelta
 from difflib import SequenceMatcher
+from io import StringIO
 from pathlib import Path
+from urllib.parse import quote_plus
 from urllib.parse import urljoin
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -16,11 +19,6 @@ import requests
 import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
-
-try:
-    import FinanceDataReader as fdr
-except ImportError:
-    fdr = None
 
 
 DEFAULT_TICKERS = {
@@ -385,38 +383,34 @@ def market_name_from_suffix(suffix: str) -> str:
     return "KOSDAQ" if suffix == ".KQ" else "KOSPI"
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_krx_listing() -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-    errors: list[str] = []
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_online_krx_master() -> pd.DataFrame:
+    urls = [
+        "https://raw.githubusercontent.com/dalinaum/rs/main/krx-list.csv",
+    ]
 
-    if fdr is None:
-        errors.append("FinanceDataReader 미설치")
-    else:
+    for url in urls:
         try:
-            listing = fdr.StockListing("KRX")
-            expected_columns = {"Code", "Name", "Market"}
-            if expected_columns.issubset(set(listing.columns)):
-                listing = listing[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
-                frames.append(listing)
-            else:
-                errors.append("FinanceDataReader 컬럼 형식 불일치")
-        except Exception:
-            errors.append("FinanceDataReader 조회 실패")
+            response = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            frame = pd.read_csv(StringIO(response.text), dtype={"Code": str})
+        except (requests.RequestException, ValueError):
+            continue
 
-    if not frames:
-        empty = pd.DataFrame(columns=["Code", "Name", "Market"])
-        empty.attrs["errors"] = errors
-        return empty
+        if not {"Code", "Name", "Market"}.issubset(frame.columns):
+            continue
 
-    frame = pd.concat(frames, ignore_index=True)
-    frame = frame[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
-    frame["Code"] = frame["Code"].astype(str).str.zfill(6)
-    frame["Name"] = frame["Name"].astype(str)
-    frame["Market"] = frame["Market"].astype(str)
-    result = frame.drop_duplicates(subset=["Code"])
-    result.attrs["errors"] = errors
-    return result
+        frame = frame[["Code", "Name", "Market"]].dropna(subset=["Code", "Name"])
+        frame["Code"] = frame["Code"].astype(str).str.zfill(6)
+        frame["Name"] = frame["Name"].astype(str).str.strip()
+        frame["Market"] = frame["Market"].astype(str).str.strip()
+        return frame.drop_duplicates(subset=["Code"])
+
+    return pd.DataFrame(columns=["Code", "Name", "Market"])
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -571,7 +565,11 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
 
     naver_matches = fetch_naver_stock_search(alias_text)
     yahoo_matches = fetch_yahoo_stock_search(alias_text)
-    candidates = pd.concat([listing, naver_matches, yahoo_matches, direct], ignore_index=True).drop_duplicates(subset=["Code"])
+    master_matches = fetch_online_krx_master()
+    candidates = pd.concat(
+        [listing, master_matches, naver_matches, yahoo_matches, direct],
+        ignore_index=True,
+    ).drop_duplicates(subset=["Code"])
     if candidates.empty:
         return pd.DataFrame(columns=["Code", "Name", "Market", "Label"])
     candidates["NormalizedName"] = candidates["Name"].map(normalize_search_text)
@@ -616,23 +614,12 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
 
 
 def stock_search_status(listing: pd.DataFrame) -> str:
-    sources = []
-    sources.extend(["네이버 금융 실시간 검색", "Yahoo Finance 실시간 검색"])
-    source_text = ", ".join(sources)
-    if len(listing) > 0:
-        source_text = f"FinanceDataReader 목록 + {source_text}"
-    return f"검색 소스: {source_text}"
-
-
-def stock_search_debug_status(listing: pd.DataFrame) -> str:
-    errors = listing.attrs.get("errors", [])
-    if not errors:
-        return "추가 오류 없음"
-    return ", ".join(errors)
+    master_count = len(fetch_online_krx_master())
+    return f"검색 소스: 온라인 KRX 종목 목록 {master_count:,}개, 네이버 금융 실시간 검색, Yahoo Finance 실시간 검색"
 
 
 def online_stock_universe(query_text: str, limit: int) -> pd.DataFrame:
-    listing = load_krx_listing()
+    listing = fetch_online_krx_master()
     frames: list[pd.DataFrame] = []
     for keyword in query_text.split():
         matches = search_krx_listing(keyword, listing, limit=limit)
@@ -936,6 +923,84 @@ def fetch_daum_news_search(query: str) -> pd.DataFrame:
     return pd.DataFrame(posts).drop_duplicates(subset=["제목", "링크"]).head(50)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_nate_news_search(query: str) -> pd.DataFrame:
+    url = "https://search.daum.net/search"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+        )
+    }
+    response = requests.get(url, params={"w": "news", "q": f"{query} site:news.nate.com"}, headers=headers, timeout=8)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    posts: list[dict[str, str]] = []
+    for link in soup.select("a[href*='news.nate.com']"):
+        title = link.get_text(" ", strip=True)
+        href = link.get("href", "")
+        if len(title) < 8:
+            continue
+        posts.append({"출처": "네이트뉴스", "날짜": "", "제목": title, "링크": href})
+
+    return pd.DataFrame(posts).drop_duplicates(subset=["제목", "링크"]).head(50)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_google_news_rss(query: str, source_name: str, extra_query: str = "") -> pd.DataFrame:
+    search_query = f"{query} {extra_query}".strip()
+    url = f"https://news.google.com/rss/search?q={quote_plus(search_query)}&hl=ko&gl=KR&ceid=KR:ko"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+        )
+    }
+    response = requests.get(url, headers=headers, timeout=8)
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+
+    posts: list[dict[str, str]] = []
+    for item in root.findall("./channel/item"):
+        title = item.findtext("title", default="").strip()
+        link = item.findtext("link", default="").strip()
+        published = item.findtext("pubDate", default="").strip()
+        if len(title) < 8:
+            continue
+        posts.append({"출처": source_name, "날짜": published, "제목": title, "링크": link})
+
+    return pd.DataFrame(posts).drop_duplicates(subset=["제목", "링크"]).head(50)
+
+
+def fetch_news_source(source: str, query: str) -> pd.DataFrame:
+    if source == "네이버뉴스":
+        return fetch_naver_news_search(query)
+    if source == "네이트뉴스":
+        return fetch_nate_news_search(query)
+    if source == "다음뉴스":
+        return fetch_daum_news_search(query)
+    if source == "주요금융뉴스":
+        return fetch_google_news_rss(
+            query,
+            "주요금융뉴스",
+            "매일경제 OR 한국경제 OR 이데일리 OR 머니투데이 OR 서울경제 OR 파이낸셜뉴스 OR 연합뉴스",
+        )
+    return pd.DataFrame(columns=["출처", "날짜", "제목", "링크"])
+
+
+def collect_news_results(query: str, sources: list[str]) -> list[CommunityResult]:
+    results: list[CommunityResult] = []
+    for source in sources:
+        try:
+            posts = fetch_news_source(source, query)
+            status = "뉴스 수집 완료" if not posts.empty else "수집된 뉴스가 없습니다."
+            results.append(analyze_community(source, posts, status=status))
+        except (requests.RequestException, ET.ParseError) as error:
+            results.append(failed_community_result(source, error))
+    return results
+
+
 def toss_unavailable_result() -> CommunityResult:
     return CommunityResult(
         source="토스",
@@ -996,7 +1061,7 @@ def community_summary_frame(results: list[CommunityResult]) -> pd.DataFrame:
     )
 
 
-def failed_community_result(source: str, error: requests.RequestException) -> CommunityResult:
+def failed_community_result(source: str, error: Exception) -> CommunityResult:
     return CommunityResult(
         source=source,
         mood="오류",
@@ -1433,11 +1498,8 @@ with st.sidebar:
             selected_history = view_history[history_options.index(history_choice) - 1]
 
     if asset_type == "주식":
-        listing = load_krx_listing()
+        listing = pd.DataFrame(columns=["Code", "Name", "Market"])
         st.caption(stock_search_status(listing))
-        with st.expander("검색 진단", expanded=False):
-            st.write(f"전체 KRX 목록 로드 수: {len(listing):,}개")
-            st.write(stock_search_debug_status(listing))
         default_stock_query = (
             selected_history["code"]
             if selected_history and selected_history.get("asset_type") == "주식"
@@ -1465,9 +1527,15 @@ with st.sidebar:
         period = st.selectbox("기간", ["6mo", "1y", "2y", "5y"], index=1, help=HELP_TEXT["period"])
         include_community = st.checkbox("커뮤니티/뉴스 분위기 비교", value=True, help=HELP_TEXT["community"])
         community_sources = st.multiselect(
-            "비교 소스",
-            options=["네이버", "토스", "다음"],
-            default=["네이버", "토스", "다음"],
+            "커뮤니티 소스",
+            options=["네이버", "토스"],
+            default=["네이버", "토스"],
+            disabled=not include_community,
+        )
+        news_sources = st.multiselect(
+            "뉴스 소스",
+            options=["네이버뉴스", "네이트뉴스", "다음뉴스", "주요금융뉴스"],
+            default=["네이버뉴스", "네이트뉴스", "다음뉴스", "주요금융뉴스"],
             disabled=not include_community,
         )
         board_pages = st.slider("네이버 토론실 수집 페이지", min_value=1, max_value=5, value=1, disabled=not include_community)
@@ -1483,9 +1551,15 @@ with st.sidebar:
         period = st.selectbox("기간", ["3mo", "6mo", "1y"], index=1, help=HELP_TEXT["period"])
         include_community = st.checkbox("코인 커뮤니티/뉴스 분위기 비교", value=True, help=HELP_TEXT["community"])
         community_sources = st.multiselect(
-            "비교 소스",
-            options=["코인톡", "네이버뉴스", "다음뉴스"],
-            default=["코인톡", "네이버뉴스", "다음뉴스"],
+            "커뮤니티 소스",
+            options=["코인톡"],
+            default=["코인톡"],
+            disabled=not include_community,
+        )
+        news_sources = st.multiselect(
+            "뉴스 소스",
+            options=["네이버뉴스", "네이트뉴스", "다음뉴스", "주요금융뉴스"],
+            default=["네이버뉴스", "네이트뉴스", "다음뉴스", "주요금융뉴스"],
             disabled=not include_community,
         )
         board_pages = 1
@@ -1584,6 +1658,7 @@ if run or raw_ticker:
     latest = data.iloc[-1]
     previous = data.iloc[-2]
     community_results: list[CommunityResult] = []
+    news_results: list[CommunityResult] = []
     if asset_type == "주식":
         history_code = krx_code(raw_ticker)
         history_name = selected_asset_name or asset_display_name(asset_type, raw_ticker).split(" (")[0]
@@ -1615,9 +1690,9 @@ if run or raw_ticker:
         st.write(f"- {reason}")
 
     if include_community and asset_type == "주식":
-        st.subheader("커뮤니티/뉴스 분위기 비교")
+        st.subheader("커뮤니티 분위기 비교")
         if len(code) != 6:
-            st.info("커뮤니티/뉴스 비교를 보려면 6자리 종목 코드가 필요합니다.")
+            st.info("커뮤니티 비교를 보려면 6자리 종목 코드가 필요합니다.")
         else:
             results: list[CommunityResult] = []
 
@@ -1642,31 +1717,12 @@ if run or raw_ticker:
             if "토스" in community_sources:
                 results.append(toss_unavailable_result())
 
-            if "다음" in community_sources:
-                try:
-                    daum_posts = fetch_daum_finance_news(code)
-                    status = "종목 뉴스 수집 완료" if not daum_posts.empty else "수집된 뉴스가 없습니다."
-                    results.append(analyze_community("다음", daum_posts, status=status))
-                except requests.RequestException as error:
-                    results.append(
-                        CommunityResult(
-                            source="다음",
-                            mood="오류",
-                            score=0,
-                            positive_hits=0,
-                            negative_hits=0,
-                            status=f"수집 실패: {error}",
-                            posts=pd.DataFrame(columns=["출처", "날짜", "제목", "링크"]),
-                        )
-                    )
-
             if results:
                 community_results = results
                 summary = community_summary_frame(results)
                 st.dataframe(summary, use_container_width=True, hide_index=True)
                 st.caption(
-                    "네이버는 종목토론실 제목, 다음은 공개 종목 뉴스 제목 기준입니다. "
-                    "토스 커뮤니티는 로그인 기반이라 공개 수집 대신 상태만 표시합니다."
+                    "네이버는 종목토론실 제목 기준입니다. 토스 커뮤니티는 로그인 기반이라 공개 수집 대신 상태만 표시합니다."
                 )
 
                 combined_posts = pd.concat([result.posts for result in results if not result.posts.empty], ignore_index=True)
@@ -1677,7 +1733,7 @@ if run or raw_ticker:
                 st.info("선택된 비교 소스가 없습니다.")
 
     if include_community and asset_type == "코인":
-        st.subheader("코인 커뮤니티/뉴스 분위기 비교")
+        st.subheader("코인 커뮤니티 분위기 비교")
         keywords = coin_keywords(ticker)
         query = coin_query(ticker)
         results: list[CommunityResult] = []
@@ -1690,29 +1746,12 @@ if run or raw_ticker:
             except requests.RequestException as error:
                 results.append(failed_community_result("코인톡", error))
 
-        if "네이버뉴스" in community_sources:
-            try:
-                naver_news = fetch_naver_news_search(query)
-                status = "뉴스 검색 수집 완료" if not naver_news.empty else "수집된 뉴스가 없습니다."
-                results.append(analyze_community("네이버뉴스", naver_news, status=status))
-            except requests.RequestException as error:
-                results.append(failed_community_result("네이버뉴스", error))
-
-        if "다음뉴스" in community_sources:
-            try:
-                daum_news = fetch_daum_news_search(query)
-                status = "뉴스 검색 수집 완료" if not daum_news.empty else "수집된 뉴스가 없습니다."
-                results.append(analyze_community("다음뉴스", daum_news, status=status))
-            except requests.RequestException as error:
-                results.append(failed_community_result("다음뉴스", error))
-
         if results:
             community_results = results
             summary = community_summary_frame(results)
             st.dataframe(summary, use_container_width=True, hide_index=True)
             st.caption(
-                "코인톡은 공개 페이지에서 선택 코인명이 들어간 글, 네이버뉴스/다음뉴스는 코인명 검색 결과 제목 기준입니다. "
-                "커뮤니티와 뉴스는 가격보다 늦거나 과열될 수 있어 참고 지표로만 보세요."
+                "코인톡은 공개 페이지에서 선택 코인명이 들어간 글 제목 기준입니다. 커뮤니티는 가격보다 늦거나 과열될 수 있어 참고 지표로만 보세요."
             )
 
             combined_posts = pd.concat([result.posts for result in results if not result.posts.empty], ignore_index=True)
@@ -1722,7 +1761,24 @@ if run or raw_ticker:
         else:
             st.info("선택된 비교 소스가 없습니다.")
 
-    community_score = sum(result.score for result in community_results)
+    if include_community and news_sources:
+        st.subheader("뉴스 분석")
+        news_query = selected_asset_name or (coin_query(ticker) if asset_type == "코인" else code)
+        news_results = collect_news_results(news_query, news_sources)
+        if news_results:
+            news_summary = community_summary_frame(news_results)
+            st.dataframe(news_summary, use_container_width=True, hide_index=True)
+            st.caption(
+                "뉴스 제목의 단순 키워드 분석입니다. 네이버, 네이트, 다음, 주요 금융 매체 검색 결과를 함께 참고합니다."
+            )
+            news_posts = pd.concat([result.posts for result in news_results if not result.posts.empty], ignore_index=True)
+            if not news_posts.empty:
+                st.write("최근 뉴스")
+                st.dataframe(news_posts[["출처", "날짜", "제목", "링크"]].head(40), use_container_width=True)
+        else:
+            st.info("선택된 뉴스 소스가 없습니다.")
+
+    community_score = sum(result.score for result in community_results + news_results)
     risk_plan = make_risk_plan(
         data=data,
         asset_type=asset_type,
