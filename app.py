@@ -139,7 +139,7 @@ DEFAULT_COINS = {
 }
 
 DEFAULT_SCAN_KEYWORDS = {
-    "주식": "삼성 두산 웅진 드림 카카오 네이버 현대 LG SK 셀트리온 한화 에코 포스코",
+    "주식": "삼성 두산 웅진 드림 카카오 네이버 현대 LG SK 셀트리온 한화 에코 포스코 금융 바이오 반도체 조선 방산 게임",
     "코인": "BTC ETH XRP SOL DOGE ADA LINK DOT AVAX SUI",
 }
 
@@ -617,13 +617,18 @@ def search_krx_listing(query: str, listing: pd.DataFrame, limit: int = 50) -> pd
 
 def stock_search_status(listing: pd.DataFrame) -> str:
     sources = []
-    if fdr is not None:
-        sources.append("FinanceDataReader")
     sources.extend(["네이버 금융 실시간 검색", "Yahoo Finance 실시간 검색"])
     source_text = ", ".join(sources)
+    if len(listing) > 0:
+        source_text = f"FinanceDataReader 목록 + {source_text}"
+    return f"검색 소스: {source_text}"
+
+
+def stock_search_debug_status(listing: pd.DataFrame) -> str:
     errors = listing.attrs.get("errors", [])
-    error_text = f" · 상태: {', '.join(errors)}" if errors else ""
-    return f"종목 목록 {len(listing):,}개 로드됨 · 소스: {source_text}{error_text}"
+    if not errors:
+        return "추가 오류 없음"
+    return ", ".join(errors)
 
 
 def online_stock_universe(query_text: str, limit: int) -> pd.DataFrame:
@@ -1430,6 +1435,9 @@ with st.sidebar:
     if asset_type == "주식":
         listing = load_krx_listing()
         st.caption(stock_search_status(listing))
+        with st.expander("검색 진단", expanded=False):
+            st.write(f"전체 KRX 목록 로드 수: {len(listing):,}개")
+            st.write(stock_search_debug_status(listing))
         default_stock_query = (
             selected_history["code"]
             if selected_history and selected_history.get("asset_type") == "주식"
@@ -1489,18 +1497,6 @@ with st.sidebar:
     atr_multiplier = st.slider("ATR 손절 배수", min_value=1.0, max_value=4.0, value=2.0, step=0.25, help=HELP_TEXT["atr_multiplier"])
 
     st.header("단기 후보 스캔")
-    stock_scan_keywords = st.text_area(
-        "주식 후보 검색어",
-        value=DEFAULT_SCAN_KEYWORDS["주식"],
-        help="공백으로 여러 검색어를 입력하면 온라인 종목 검색 결과를 합쳐서 후보군을 만듭니다.",
-        height=80,
-    )
-    coin_scan_keywords = st.text_area(
-        "코인 후보 검색어",
-        value=DEFAULT_SCAN_KEYWORDS["코인"],
-        help="업비트 KRW 마켓에서 심볼이나 코인명을 검색해 후보군을 만듭니다.",
-        height=80,
-    )
     scan_limit = st.slider("스캔 후보 수", min_value=5, max_value=50, value=20, step=5)
 
     run = st.button("분석 실행", type="primary", use_container_width=True)
@@ -1517,8 +1513,8 @@ if scan_short_term:
     show_candidate_help()
 
     with st.spinner("주식과 코인 후보를 스캔하는 중입니다..."):
-        stock_universe = online_stock_universe(stock_scan_keywords, scan_limit)
-        coin_universe = online_coin_universe(coin_scan_keywords, scan_limit)
+        stock_universe = online_stock_universe(DEFAULT_SCAN_KEYWORDS["주식"], scan_limit)
+        coin_universe = online_coin_universe(DEFAULT_SCAN_KEYWORDS["코인"], scan_limit)
         stock_candidates = scan_candidates("주식", "6mo", ".KS", stock_universe)
         coin_candidates = scan_candidates("코인", "6mo", universe_frame=coin_universe)
 
