@@ -747,6 +747,60 @@ def load_price_data(ticker: str, period: str) -> pd.DataFrame:
     return data.dropna(subset=["Close"])
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_naver_current_price(code: str) -> float | None:
+    if len(code) != 6:
+        return None
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
+        )
+    }
+    try:
+        response = requests.get(
+            "https://finance.naver.com/item/main.naver",
+            params={"code": code},
+            headers=headers,
+            timeout=8,
+        )
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "euc-kr"
+    except requests.RequestException:
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    price_node = soup.select_one(".no_today .blind")
+    if not price_node:
+        price_node = soup.select_one("p.no_today span.blind")
+    if not price_node:
+        return None
+
+    digits = re.sub(r"[^0-9.]", "", price_node.get_text(strip=True))
+    if not digits:
+        return None
+
+    try:
+        return float(digits)
+    except ValueError:
+        return None
+
+
+def apply_current_price_override(data: pd.DataFrame, current_price: float | None) -> pd.DataFrame:
+    if current_price is None or current_price <= 0 or data.empty:
+        return data
+
+    frame = data.copy()
+    last_index = frame.index[-1]
+    frame.loc[last_index, "Close"] = current_price
+    if "High" in frame.columns:
+        frame.loc[last_index, "High"] = max(float(frame.loc[last_index, "High"]), current_price)
+    if "Low" in frame.columns:
+        frame.loc[last_index, "Low"] = min(float(frame.loc[last_index, "Low"]), current_price)
+    return frame
+
+
 def load_upbit_daily_data(market: str, period: str) -> pd.DataFrame:
     count = UPBIT_PERIODS.get(period, 180)
     url = "https://api.upbit.com/v1/candles/days"
@@ -1676,6 +1730,13 @@ with st.sidebar:
     holding_avg_price = st.number_input("평균 매수가", min_value=0.0, value=0.0, step=avg_step, help=HELP_TEXT["holding_avg"])
     holding_quantity = st.number_input("보유 수량", min_value=0.0, value=0.0, step=qty_step, format="%.8f", help=HELP_TEXT["holding_qty"])
     additional_cash = st.number_input("추가 투입 가능금액", min_value=0.0, value=0.0, step=10000.0, help=HELP_TEXT["additional_cash"])
+    manual_current_price = st.number_input(
+        "현재가 직접 입력",
+        min_value=0.0,
+        value=0.0,
+        step=avg_step,
+        help="증권앱 현재가와 다를 때 입력하세요. 0이면 주식은 네이버 현재가, 코인은 업비트 데이터를 사용합니다.",
+    )
 
     st.header("단기 후보 스캔")
     scan_limit = st.slider("스캔 후보 수", min_value=5, max_value=50, value=20, step=5)
@@ -1755,6 +1816,19 @@ if run or raw_ticker:
         except requests.RequestException as error:
             st.error(f"데이터를 불러오지 못했습니다: {error}")
             st.stop()
+
+    price_source = "데이터 종가"
+    current_price_for_calc: float | None = None
+    if manual_current_price > 0:
+        current_price_for_calc = float(manual_current_price)
+        price_source = "직접 입력 현재가"
+    elif asset_type == "주식":
+        naver_price = fetch_naver_current_price(code)
+        if naver_price:
+            current_price_for_calc = naver_price
+            price_source = "네이버 금융 현재가"
+
+    raw_data = apply_current_price_override(raw_data, current_price_for_calc)
 
     if raw_data.empty or len(raw_data) < 70:
         st.error("데이터를 충분히 불러오지 못했습니다. 코드와 시장 구분을 확인해 주세요.")
@@ -1913,46 +1987,52 @@ if run or raw_ticker:
         profit_plan=profit_plan,
     )
 
-    st.subheader("손실 최소화 계획")
-    r1, r2, r3, r4 = st.columns(4)
-    r1.metric("위험 등급", risk_plan.grade, f"위험점수 {risk_plan.risk_score}", help=HELP_TEXT["risk_grade"])
-    r2.metric("기준 손절가", f"{risk_plan.stop_price:,.0f}{unit}", f"{risk_plan.stop_loss_pct:.2f}%", help=HELP_TEXT["stop_price"])
-    r3.metric("진입 금액", f"{risk_plan.position_value:,.0f}원", help=HELP_TEXT["position_value"])
-    r4.metric("예상 최대손실", f"{risk_plan.expected_loss:,.0f}원", f"한도 {risk_plan.risk_budget:,.0f}원", help=HELP_TEXT["expected_loss"])
+    market_tab, holding_tab = st.tabs(["시장 분석", "내 보유 분석"])
 
-    detail1, detail2, detail3 = st.columns(3)
-    detail1.metric("계산 수량", f"{risk_plan.position_qty:,.6g}")
-    detail2.metric("20일 변동성", f"{risk_plan.volatility_20d:.2f}%", help=HELP_TEXT["volatility"])
-    detail3.metric("60일 고점 대비", f"{risk_plan.drawdown_60d:.2f}%", help=HELP_TEXT["drawdown"])
-    for note in risk_plan.notes:
-        st.write(f"- {note}")
+    with market_tab:
+        st.subheader("손실 최소화 계획")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("위험 등급", risk_plan.grade, f"위험점수 {risk_plan.risk_score}", help=HELP_TEXT["risk_grade"])
+        r2.metric("기준 손절가", f"{risk_plan.stop_price:,.0f}{unit}", f"{risk_plan.stop_loss_pct:.2f}%", help=HELP_TEXT["stop_price"])
+        r3.metric("진입 금액", f"{risk_plan.position_value:,.0f}원", help=HELP_TEXT["position_value"])
+        r4.metric("예상 최대손실", f"{risk_plan.expected_loss:,.0f}원", f"한도 {risk_plan.risk_budget:,.0f}원", help=HELP_TEXT["expected_loss"])
 
-    st.subheader("수익성 강화 지표")
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("수익성 등급", profit_plan.grade, f"점수 {profit_plan.profit_score:+d}", help=HELP_TEXT["profit_grade"])
-    p2.metric("1차 목표가", f"{profit_plan.target_price_1:,.0f}{unit}", f"{profit_plan.target_return_1:.2f}%", help=HELP_TEXT["target_price"])
-    p3.metric("2차 목표가", f"{profit_plan.target_price_2:,.0f}{unit}", f"{profit_plan.target_return_2:.2f}%", help=HELP_TEXT["target_price"])
-    p4.metric("손익비", f"{profit_plan.reward_risk_1:.2f} / {profit_plan.reward_risk_2:.2f}", help=HELP_TEXT["reward_risk"])
-
-    pp1, pp2, pp3 = st.columns(3)
-    pp1.metric("20일 고점 여지", f"{profit_plan.upside_to_20d_high:.2f}%", help=HELP_TEXT["upside"])
-    pp2.metric("60일 고점 여지", f"{profit_plan.upside_to_60d_high:.2f}%", help=HELP_TEXT["upside"])
-    pp3.metric("5일 모멘텀", f"{profit_plan.momentum_5d:.2f}%", help=HELP_TEXT["momentum_5d"])
-    for note in profit_plan.notes:
-        st.write(f"- {note}")
-
-    if holding_plan:
-        st.subheader("내 보유 기준 의견")
-        h1, h2, h3, h4 = st.columns(4)
-        h1.metric("보유 의견", holding_plan.opinion)
-        h2.metric("평가손익률", f"{holding_plan.pnl_pct:.2f}%", f"{holding_plan.pnl_amount:,.0f}원")
-        h3.metric("평가금액", f"{holding_plan.current_value:,.0f}원", f"매입 {holding_plan.cost_value:,.0f}원")
-        h4.metric("물타기 후 평단", f"{holding_plan.new_avg_price:,.0f}원", f"추가수량 {holding_plan.additional_qty:,.6g}")
-        for note in holding_plan.notes:
+        detail1, detail2, detail3 = st.columns(3)
+        detail1.metric("계산 수량", f"{risk_plan.position_qty:,.6g}")
+        detail2.metric("20일 변동성", f"{risk_plan.volatility_20d:.2f}%", help=HELP_TEXT["volatility"])
+        detail3.metric("60일 고점 대비", f"{risk_plan.drawdown_60d:.2f}%", help=HELP_TEXT["drawdown"])
+        for note in risk_plan.notes:
             st.write(f"- {note}")
 
-    st.subheader("최근 지표")
-    recent = data[["Close", "MA5", "MA20", "MA60", "ATR20", "RSI14", "RETURN_5D", "RETURN_20D", "MACD", "MACD_SIGNAL", "Volume"]].tail(10)
-    st.dataframe(recent.style.format("{:,.2f}"), use_container_width=True)
+        st.subheader("수익성 강화 지표")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("수익성 등급", profit_plan.grade, f"점수 {profit_plan.profit_score:+d}", help=HELP_TEXT["profit_grade"])
+        p2.metric("1차 목표가", f"{profit_plan.target_price_1:,.0f}{unit}", f"{profit_plan.target_return_1:.2f}%", help=HELP_TEXT["target_price"])
+        p3.metric("2차 목표가", f"{profit_plan.target_price_2:,.0f}{unit}", f"{profit_plan.target_return_2:.2f}%", help=HELP_TEXT["target_price"])
+        p4.metric("손익비", f"{profit_plan.reward_risk_1:.2f} / {profit_plan.reward_risk_2:.2f}", help=HELP_TEXT["reward_risk"])
 
-    st.caption(f"마지막 데이터 기준일: {data.index[-1].date() if hasattr(data.index[-1], 'date') else date.today()}")
+        pp1, pp2, pp3 = st.columns(3)
+        pp1.metric("20일 고점 여지", f"{profit_plan.upside_to_20d_high:.2f}%", help=HELP_TEXT["upside"])
+        pp2.metric("60일 고점 여지", f"{profit_plan.upside_to_60d_high:.2f}%", help=HELP_TEXT["upside"])
+        pp3.metric("5일 모멘텀", f"{profit_plan.momentum_5d:.2f}%", help=HELP_TEXT["momentum_5d"])
+        for note in profit_plan.notes:
+            st.write(f"- {note}")
+
+        st.subheader("최근 지표")
+        recent = data[["Close", "MA5", "MA20", "MA60", "ATR20", "RSI14", "RETURN_5D", "RETURN_20D", "MACD", "MACD_SIGNAL", "Volume"]].tail(10)
+        st.dataframe(recent.style.format("{:,.2f}"), use_container_width=True)
+        st.caption(f"마지막 데이터 기준일: {data.index[-1].date() if hasattr(data.index[-1], 'date') else date.today()}")
+
+    with holding_tab:
+        st.subheader("내 보유 기준 의견")
+        if holding_plan:
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("보유 의견", holding_plan.opinion)
+            h2.metric("평가손익률", f"{holding_plan.pnl_pct:.2f}%", f"{holding_plan.pnl_amount:,.0f}원")
+            h3.metric("평가금액", f"{holding_plan.current_value:,.0f}원", f"매입 {holding_plan.cost_value:,.0f}원")
+            h4.metric("물타기 후 평단", f"{holding_plan.new_avg_price:,.0f}원", f"추가수량 {holding_plan.additional_qty:,.6g}")
+            st.caption(f"보유손익 계산 기준 가격: {price_source}")
+            for note in holding_plan.notes:
+                st.write(f"- {note}")
+        else:
+            st.info("사이드바의 내 보유 상태에 평균 매수가와 보유 수량을 입력하면 보유자 관점 의견이 표시됩니다.")
