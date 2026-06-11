@@ -334,6 +334,7 @@ class HoldingPlan:
     new_avg_price: float
     additional_qty: float
     notes: list[str]
+    action_plan: list[dict[str, str]]
 
 
 def normalize_krx_ticker(raw: str, market_suffix: str) -> str:
@@ -758,6 +759,25 @@ def fetch_naver_current_price(code: str) -> float | None:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36"
         )
     }
+    try:
+        response = requests.get(
+            "https://polling.finance.naver.com/api/realtime",
+            params={"query": f"SERVICE_ITEM:{code}"},
+            headers=headers,
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        areas = payload.get("result", {}).get("areas", [])
+        if areas:
+            data_rows = areas[0].get("datas", [])
+            if data_rows:
+                current_value = data_rows[0].get("nv")
+                if current_value is not None and float(current_value) > 0:
+                    return float(current_value)
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+
     try:
         response = requests.get(
             "https://finance.naver.com/item/main.naver",
@@ -1509,6 +1529,94 @@ def make_holding_plan(
     if pnl_pct < 0 and current_price < avg_price and current_price > risk_plan.stop_price:
         notes.append("물타기는 한 번에 크게 넣기보다 2~3회 분할하고, 손절 기준을 유지하는 편이 안전합니다.")
 
+    def portion_qty(ratio: float) -> float:
+        raw_quantity = quantity * ratio
+        return np.floor(raw_quantity) if asset_type == "주식" else round(raw_quantity, 8)
+
+    protect_price = max(avg_price, risk_plan.stop_price) if pnl_pct > 0 else risk_plan.stop_price
+    action_plan: list[dict[str, str]] = []
+
+    if pnl_pct >= 30:
+        action_plan.extend(
+            [
+                {
+                    "조건": "현재 구간",
+                    "의견": "수익 보호를 위해 30~50% 분할 익절 검토",
+                    "참고 수량": f"{portion_qty(0.4):,.6g}",
+                },
+                {
+                    "조건": f"2차 목표가 {profit_plan.target_price_2:,.0f}원 부근",
+                    "의견": "잔여 물량의 절반 추가 익절 검토",
+                    "참고 수량": f"{portion_qty(0.3):,.6g}",
+                },
+                {
+                    "조건": f"보호선 {protect_price:,.0f}원 이탈",
+                    "의견": "남은 수익 보호를 위해 잔여분 축소 검토",
+                    "참고 수량": "잔여 수량",
+                },
+            ]
+        )
+    elif pnl_pct >= 10:
+        action_plan.extend(
+            [
+                {
+                    "조건": f"1차 목표가 {profit_plan.target_price_1:,.0f}원 부근",
+                    "의견": "20~30% 분할 익절 검토",
+                    "참고 수량": f"{portion_qty(0.25):,.6g}",
+                },
+                {
+                    "조건": f"2차 목표가 {profit_plan.target_price_2:,.0f}원 부근",
+                    "의견": "추가 20~30% 익절 검토",
+                    "참고 수량": f"{portion_qty(0.25):,.6g}",
+                },
+                {
+                    "조건": f"보호선 {protect_price:,.0f}원 이탈",
+                    "의견": "수익이 손실로 바뀌기 전에 비중 축소 검토",
+                    "참고 수량": "보유분 일부 또는 전부",
+                },
+            ]
+        )
+    elif pnl_pct >= 0:
+        action_plan.extend(
+            [
+                {
+                    "조건": f"1차 목표가 {profit_plan.target_price_1:,.0f}원 도달",
+                    "의견": "소량 익절 후 추세 확인",
+                    "참고 수량": f"{portion_qty(0.2):,.6g}",
+                },
+                {
+                    "조건": f"평단 {avg_price:,.0f}원 하향 이탈",
+                    "의견": "본전 보호 관점에서 비중 축소 검토",
+                    "참고 수량": f"{portion_qty(0.3):,.6g}",
+                },
+                {
+                    "조건": f"손절 기준 {risk_plan.stop_price:,.0f}원 이탈",
+                    "의견": "버티기보다 손실 제한 우선",
+                    "참고 수량": "잔여 수량",
+                },
+            ]
+        )
+    else:
+        action_plan.extend(
+            [
+                {
+                    "조건": f"현재 손익 {pnl_pct:.2f}%",
+                    "의견": "추가매수 전 기술적 신호와 위험등급 재확인",
+                    "참고 수량": "추가매수 보류",
+                },
+                {
+                    "조건": f"손절 기준 {risk_plan.stop_price:,.0f}원 이탈",
+                    "의견": "물타기 금지, 손실 제한 우선",
+                    "참고 수량": "보유분 축소 검토",
+                },
+                {
+                    "조건": f"현재가가 20일선 회복 + 신호점수 2 이상",
+                    "의견": "조건 충족 시에만 소액 분할 물타기 검토",
+                    "참고 수량": f"최대 {additional_qty:,.6g}",
+                },
+            ]
+        )
+
     return HoldingPlan(
         opinion=opinion,
         pnl_pct=pnl_pct,
@@ -1518,6 +1626,7 @@ def make_holding_plan(
         new_avg_price=new_avg_price,
         additional_qty=additional_qty,
         notes=notes,
+        action_plan=action_plan,
     )
 
 
@@ -1633,8 +1742,158 @@ def rsi_chart(data: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def inject_responsive_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            max-width: 1480px;
+            padding-top: 1.5rem;
+            padding-bottom: 3rem;
+        }
+
+        [data-testid="stDataFrame"],
+        [data-testid="stTable"] {
+            max-width: 100%;
+            overflow-x: auto;
+        }
+
+        [data-baseweb="tab-list"] {
+            overflow-x: auto;
+            scrollbar-width: thin;
+        }
+
+        [data-baseweb="tab"] {
+            flex: 0 0 auto;
+            white-space: nowrap;
+        }
+
+        @media (max-width: 768px) {
+            .block-container {
+                padding: 0.75rem 0.75rem 2rem;
+            }
+
+            h1 {
+                font-size: 1.45rem !important;
+                line-height: 1.3 !important;
+                overflow-wrap: anywhere;
+                word-break: keep-all;
+            }
+
+            h2 {
+                font-size: 1.2rem !important;
+                line-height: 1.35 !important;
+            }
+
+            h3 {
+                font-size: 1.05rem !important;
+                line-height: 1.4 !important;
+            }
+
+            p, li, label {
+                line-height: 1.55;
+            }
+
+            div[data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap;
+                gap: 0.55rem;
+            }
+
+            div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+                flex: 1 1 calc(50% - 0.55rem) !important;
+                min-width: 145px !important;
+                width: auto !important;
+            }
+
+            div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"]:has([data-testid="stPlotlyChart"]) {
+                flex-basis: 100% !important;
+                min-width: 100% !important;
+            }
+
+            [data-testid="stMetric"] {
+                min-height: 112px;
+                padding: 0.65rem 0.7rem;
+                border: 1px solid rgba(128, 128, 128, 0.22);
+                border-radius: 8px;
+            }
+
+            [data-testid="stMetricLabel"] {
+                font-size: 0.78rem;
+            }
+
+            [data-testid="stMetricValue"] {
+                font-size: 1.12rem;
+                line-height: 1.25;
+                overflow-wrap: anywhere;
+            }
+
+            [data-testid="stMetricDelta"] {
+                font-size: 0.76rem;
+            }
+
+            [data-testid="stPlotlyChart"] {
+                max-width: 100%;
+                overflow: hidden;
+            }
+
+            [data-testid="stDataFrame"] {
+                min-height: 230px;
+            }
+
+            [data-baseweb="tab-list"] {
+                gap: 0.25rem;
+                padding-bottom: 0.2rem;
+            }
+
+            [data-baseweb="tab"] {
+                min-height: 44px;
+                padding-left: 0.85rem;
+                padding-right: 0.85rem;
+            }
+
+            .stButton > button,
+            .stDownloadButton > button {
+                min-height: 44px;
+                width: 100%;
+            }
+
+            input, textarea, [data-baseweb="select"] {
+                font-size: 16px !important;
+            }
+
+            [data-testid="stRadio"] [role="radiogroup"] {
+                flex-wrap: wrap;
+                row-gap: 0.35rem;
+            }
+
+            section[data-testid="stSidebar"] {
+                width: min(88vw, 350px) !important;
+            }
+        }
+
+        @media (max-width: 390px) {
+            div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+                min-width: 132px !important;
+            }
+
+            [data-testid="stMetric"] {
+                min-height: 106px;
+                padding: 0.55rem;
+            }
+
+            [data-testid="stMetricValue"] {
+                font-size: 1rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 st.set_page_config(page_title="한국 주식 자동 매매 신호", page_icon="📈", layout="wide")
 require_password()
+inject_responsive_styles()
 
 title_area = st.empty()
 st.caption("기술적 지표 기반의 참고용 신호입니다. 실제 매매 전에는 재무, 뉴스, 수급, 변동성, 리스크를 함께 확인하세요.")
@@ -1817,6 +2076,7 @@ if run or raw_ticker:
             st.error(f"데이터를 불러오지 못했습니다: {error}")
             st.stop()
 
+    latest_data_close = float(raw_data["Close"].iloc[-1]) if not raw_data.empty else 0.0
     price_source = "데이터 종가"
     current_price_for_calc: float | None = None
     if manual_current_price > 0:
@@ -1851,9 +2111,13 @@ if run or raw_ticker:
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("자동 신호", signal.action, f"점수 {signal.score:+d}", help=HELP_TEXT["auto_signal"])
-    col2.metric("종가", f"{latest['Close']:,.0f}{unit}", f"{latest['Close'] - previous['Close']:,.0f}{unit}")
+    col2.metric("현재가", f"{latest['Close']:,.0f}{unit}", f"{latest['Close'] - previous['Close']:,.0f}{unit}")
     col3.metric("RSI14", f"{latest['RSI14']:.1f}", help=HELP_TEXT["rsi"])
     col4.metric("20일 수익률", f"{latest['RETURN_20D']:.2f}%", help=HELP_TEXT["return_20d"])
+    if asset_type == "주식":
+        st.caption(f"현재가 출처: {price_source} · Yahoo 최근 종가: {latest_data_close:,.0f}원")
+    else:
+        st.caption(f"현재가 출처: {price_source}")
 
     st.plotly_chart(price_chart(data, ticker, unit), use_container_width=True)
 
@@ -2034,5 +2298,11 @@ if run or raw_ticker:
             st.caption(f"보유손익 계산 기준 가격: {price_source}")
             for note in holding_plan.notes:
                 st.write(f"- {note}")
+            st.subheader("조건별 익절·손절 계획")
+            st.dataframe(
+                pd.DataFrame(holding_plan.action_plan),
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
             st.info("사이드바의 내 보유 상태에 평균 매수가와 보유 수량을 입력하면 보유자 관점 의견이 표시됩니다.")
